@@ -1,5 +1,5 @@
 // main.js
-import { computeResultant, downloadCSV, KalmanFilter1D } from './analysis.js';
+import { downloadCSV, KalmanFilter1D , updateGravity, projectToHorizontal } from './analysis.js';
 
 const MAX_WINDOW_MS   = 5000;
 const UPDATE_INTERVAL = 100;    // ms
@@ -80,14 +80,23 @@ function startSensors() {
     });
 
     const onReading = (x, y, z) => {
-        const t = Date.now();
-        buf.push({ t, x, y, z });
+        const t   = Date.now();
+        const raw = { x, y, z };
 
-        // predict step on resultant magnitude
-        const { mag } = computeResultant({ t, x, y, z });
-        kf.predict(mag);
+        // 1) Update our rolling gravity estimate
+        updateGravity(raw);
 
-        // record fused velocity
+        // 2) Project out the gravity component → horizontal accel
+        const hor = projectToHorizontal(raw);
+
+        // 3) Buffer the horizontal sample instead of the full vector
+        buf.push({ t, x: hor.x, y: hor.y, z: hor.z });
+
+        // 4) Use the magnitude of horizontal accel in your Kalman predict
+        const horMag = Math.hypot(hor.x, hor.y, hor.z);
+        kf.predict(horMag);
+
+        // 5) Record the fused velocity, as before
         velBuf.push({ t, v: kf.velocity });
     };
 

@@ -6,6 +6,30 @@ export function computeResultant({ t, x, y, z }) {
     return { t, mag };
 }
 
+let gEst = { x:0, y:0, z:0 };
+const α = 0.98;  // how much history to hold
+
+export function updateGravity(raw) {
+    // raw = { x, y, z }
+    gEst.x = α*gEst.x + (1-α)*raw.x;
+    gEst.y = α*gEst.y + (1-α)*raw.y;
+    gEst.z = α*gEst.z + (1-α)*raw.z;
+    // normalize so gEst is a unit vector
+    const mag = Math.hypot(gEst.x, gEst.y, gEst.z);
+    gEst.x /= mag; gEst.y /= mag; gEst.z /= mag;
+    return gEst;
+}
+
+export function projectToHorizontal(raw) {
+    const g = gEst;  // from updateGravity
+    const dot = raw.x*g.x + raw.y*g.y + raw.z*g.z;
+    return {
+        x: raw.x - dot*g.x,
+        y: raw.y - dot*g.y,
+        z: raw.z - dot*g.z
+    };
+}
+
 // simple 1-D Kalman Filter for velocity
 export class KalmanFilter1D {
     /**
