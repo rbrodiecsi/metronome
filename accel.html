@@ -2,110 +2,134 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8">
-  <title>Accel POC</title>
+  <title>Live Accelerometer Chart</title>
   <style>
-    body { font-family: sans-serif; padding: 1rem; }
-    #output { font-size: 1.25rem; margin-top: 1rem; }
+    body { font-family: sans-serif; padding: 1rem; background: #f5f5f5; }
+    #controls { margin-bottom: 1rem; }
+    canvas { background: #fff; border: 1px solid #ccc; }
     button { padding: .5rem 1rem; font-size: 1rem; }
   </style>
 </head>
 <body>
-  <h1>Accelerometer Summary (last 1 sec)</h1>
-  <button id="startBtn">Start Sensors</button>
-  <div id="output">Waiting to start…</div>
+  <div id="controls">
+    <button id="startBtn">Start Sensors & Chart</button>
+  </div>
+  <canvas id="accelChart" width="600" height="300"></canvas>
 
+  <!-- Chart.js from CDN -->
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
   <script>
-    const output = document.getElementById('output');
-    const startBtn = document.getElementById('startBtn');
+    const buf = []; // holds {t: ms, x,y,z}
+    const DURATION = 5000; // ms to show
+    let chart, sensor;
 
-    // buffer: array of { t: timestamp, x,y,z }
-    let buffer = [];
+    // 1) Set up Chart.js with empty data
+    function createChart() {
+      const ctx = document.getElementById('accelChart').getContext('2d');
+      chart = new Chart(ctx, {
+        type: 'line',
+        data: {
+          labels: [], // timestamps
+          datasets: [
+            { label: 'X', data: [], borderColor: 'red',    fill: false },
+            { label: 'Y', data: [], borderColor: 'green',  fill: false },
+            { label: 'Z', data: [], borderColor: 'blue',   fill: false },
+          ]
+        },
+        options: {
+          animation: false,
+          scales: {
+            x: {
+              type: 'realtime',   // requires chartjs-plugin-streaming
+              realtime: {
+                duration: DURATION,
+                refresh: 100,
+                delay: 0,
+                onRefresh: updateChart
+              }
+            },
+            y: { suggestedMin: -20, suggestedMax: 20 }
+          },
+          plugins: {
+            streaming: {           // chartjs-plugin-streaming options
+              frameRate: 30       // limits chart redraws/sec
+            }
+          }
+        }
+      });
+    }
 
-    function summarizeAndDisplay() {
+    // 2) Pull last 5s from buf and push into chart
+    function updateChart(chart) {
       const now = performance.now();
-      // keep only last 1000ms
-      buffer = buffer.filter(d => now - d.t <= 1000);
-      const N = buffer.length;
-      if (N === 0) {
-        output.textContent = 'No samples in the last second.';
-        return;
-      }
-      const sums = buffer.reduce((s, d) => {
-        s.x += d.x; s.y += d.y; s.z += d.z;
-        return s;
-      }, { x: 0, y: 0, z: 0 });
+      // prune old
+      while (buf.length && now - buf[0].t > DURATION) buf.shift();
 
-      const avg = {
-        x: sums.x / N,
-        y: sums.y / N,
-        z: sums.z / N
-      };
-
-      output.textContent = 
-        `Samples: ${N} · ` +
-        `Avg X:${avg.x.toFixed(2)} ` +
-        `Y:${avg.y.toFixed(2)} ` +
-        `Z:${avg.z.toFixed(2)}`;
+      chart.data.datasets[0].data.push({
+        x: now,
+        y: buf.length ? buf[buf.length-1].x : null
+      });
+      chart.data.datasets[1].data.push({
+        x: now,
+        y: buf.length ? buf[buf.length-1].y : null
+      });
+      chart.data.datasets[2].data.push({
+        x: now,
+        y: buf.length ? buf[buf.length-1].z : null
+      });
     }
 
-    function startGenericSensor() {
-      try {
-        const sensor = new Accelerometer({ frequency: 60 });
-        sensor.addEventListener('reading', () => {
-          buffer.push({ 
-            t: performance.now(), 
-            x: sensor.x, 
-            y: sensor.y, 
-            z: sensor.z 
+    // 3) Sensor setup (Generic → fallback)
+    function startSensor() {
+      if ('Accelerometer' in window) {
+        try {
+          sensor = new Accelerometer({ frequency: 60 });
+          sensor.addEventListener('reading', () => {
+            buf.push({ t: performance.now(), x: sensor.x, y: sensor.y, z: sensor.z });
           });
-        });
-        sensor.addEventListener('error', e => {
-          console.error('Generic Sensor error', e.error);
-          fallbackToDeviceMotion();
-        });
-        sensor.start();
-      } catch (e) {
-        console.warn('Accelerometer ctor failed:', e);
-        fallbackToDeviceMotion();
+          sensor.addEventListener('error', e => {
+            console.warn('Accel error', e.error);
+            fallback();
+          });
+          sensor.start();
+          return;
+        } catch (e) {
+          console.warn('Accelerometer ctor failed', e);
+        }
       }
+      fallback();
     }
 
-    function fallbackToDeviceMotion() {
+    function fallback() {
       if (!('DeviceMotionEvent' in window)) {
-        output.textContent = 'No accelerometer support.';
+        alert('No accelerometer support!');
         return;
       }
-      // iOS 13+ permission
       function listen() {
         window.addEventListener('devicemotion', ev => {
-          const a = ev.acceleration || ev.accelerationIncludingGravity;
-          if (a) {
-            buffer.push({ t: performance.now(), x: a.x, y: a.y, z: a.z });
-          }
+          const a = ev.accelerationIncludingGravity || ev.acceleration;
+          if (!a) return;
+          buf.push({ t: performance.now(), x: a.x, y: a.y, z: a.z });
         });
       }
       if (typeof DeviceMotionEvent.requestPermission === 'function') {
         DeviceMotionEvent.requestPermission()
-          .then(p => {
-            if (p === 'granted') listen();
-            else output.textContent = 'Permission denied.';
-          })
-          .catch(err => {
-            console.error(err);
-            output.textContent = 'Permission error.';
-          });
+          .then(p => p === 'granted' ? listen() : alert('Permission denied'))
+          .catch(console.error);
       } else {
         listen();
       }
     }
 
-    startBtn.addEventListener('click', () => {
-      startBtn.disabled = true;
-      output.textContent = 'Starting…';
-      startGenericSensor();
-      // every 1s, update summary
-      setInterval(summarizeAndDisplay, 1000);
+    // 4) Wire up start button
+    document.getElementById('startBtn').addEventListener('click', () => {
+      document.getElementById('startBtn').disabled = true;
+      createChart();
+      startSensor();
     });
   </script>
+
+  <!-- NOTE: chartjs-plugin-streaming is required for real-time chart support -->
+  <script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-streaming@2.0.0"></script>
 </body>
 </html>
