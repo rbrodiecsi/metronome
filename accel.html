@@ -2,116 +2,97 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8">
-  <title>Live Accelerometer Chart</title>
+  <title>Live Accel Plot (Plotly.js)</title>
   <style>
-    body { font-family: sans-serif; padding: 1rem; background: #f5f5f5; }
+    body { font-family: sans-serif; padding: 1rem; background: #f0f0f0; }
     #controls { margin-bottom: 1rem; }
-    canvas { background: #fff; border: 1px solid #ccc; }
-    button { padding: .5rem 1rem; font-size: 1rem; }
+    #chart { width: 100%; max-width: 700px; height: 400px; margin: auto; }
+    button { padding: 0.5rem 1rem; font-size: 1rem; }
   </style>
 </head>
 <body>
   <div id="controls">
-    <button id="startBtn">Start Sensors & Chart</button>
+    <button id="startBtn">Start Sensors & Plot</button>
   </div>
-  <canvas id="accelChart" width="600" height="300"></canvas>
+  <div id="chart"></div>
 
-  <!-- Chart.js from CDN -->
-  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <!-- Plotly.js -->
+  <script src="https://cdn.plot.ly/plotly-latest.min.js"></script>
   <script>
-    const buf = []; // holds {t: ms, x,y,z}
-    const DURATION = 5000; // ms to show
-    let chart, sensor;
+    const MAX_WINDOW = 5000;    // ms of data to show
+    const UPDATE_INTERVAL = 100; // ms between chart updates
 
-    // 1) Set up Chart.js with empty data
-    function createChart() {
-      const ctx = document.getElementById('accelChart').getContext('2d');
-      chart = new Chart(ctx, {
-        type: 'line',
-        data: {
-          labels: [], // timestamps
-          datasets: [
-            { label: 'X', data: [], borderColor: 'red',    fill: false },
-            { label: 'Y', data: [], borderColor: 'green',  fill: false },
-            { label: 'Z', data: [], borderColor: 'blue',   fill: false },
-          ]
-        },
-        options: {
-          animation: false,
-          scales: {
-            x: {
-              type: 'realtime',   // requires chartjs-plugin-streaming
-              realtime: {
-                duration: DURATION,
-                refresh: 100,
-                delay: 0,
-                onRefresh: updateChart
-              }
-            },
-            y: { suggestedMin: -20, suggestedMax: 20 }
-          },
-          plugins: {
-            streaming: {           // chartjs-plugin-streaming options
-              frameRate: 30       // limits chart redraws/sec
-            }
-          }
-        }
+    // Hold the latest sample
+    let lastSample = { x: 0, y: 0, z: 0 };
+
+    // Initialize empty traces
+    const traces = [
+      { x: [], y: [], name: 'X', mode: 'lines', line: { color: 'red' } },
+      { x: [], y: [], name: 'Y', mode: 'lines', line: { color: 'green' } },
+      { x: [], y: [], name: 'Z', mode: 'lines', line: { color: 'blue' } }
+    ];
+
+    // Create the Plotly plot
+    Plotly.newPlot('chart', traces, {
+      xaxis: {
+        type: 'date',
+        range: [ Date.now() - MAX_WINDOW, Date.now() ],
+        title: 'Time'
+      },
+      yaxis: {
+        title: 'Acceleration (m/s²)'
+      },
+      margin: { t: 30 }
+    });
+
+    // Every UPDATE_INTERVAL, push the latest sample into each trace
+    function updatePlot() {
+      const now = new Date();
+      Plotly.extendTraces('chart', {
+        x: [[now], [now], [now]],
+        y: [[lastSample.x], [lastSample.y], [lastSample.z]]
+      }, [0, 1, 2]);
+
+      // Slide the window
+      Plotly.relayout('chart', {
+        'xaxis.range': [ Date.now() - MAX_WINDOW, Date.now() ]
       });
     }
 
-    // 2) Pull last 5s from buf and push into chart
-    function updateChart(chart) {
-      const now = performance.now();
-      // prune old
-      while (buf.length && now - buf[0].t > DURATION) buf.shift();
-
-      chart.data.datasets[0].data.push({
-        x: now,
-        y: buf.length ? buf[buf.length-1].x : null
-      });
-      chart.data.datasets[1].data.push({
-        x: now,
-        y: buf.length ? buf[buf.length-1].y : null
-      });
-      chart.data.datasets[2].data.push({
-        x: now,
-        y: buf.length ? buf[buf.length-1].z : null
-      });
-    }
-
-    // 3) Sensor setup (Generic → fallback)
-    function startSensor() {
+    // Try Generic Sensor API, else fallback
+    function startSensors() {
       if ('Accelerometer' in window) {
         try {
-          sensor = new Accelerometer({ frequency: 60 });
+          const sensor = new Accelerometer({ frequency: 60 });
           sensor.addEventListener('reading', () => {
-            buf.push({ t: performance.now(), x: sensor.x, y: sensor.y, z: sensor.z });
+            lastSample = { x: sensor.x, y: sensor.y, z: sensor.z };
           });
           sensor.addEventListener('error', e => {
-            console.warn('Accel error', e.error);
-            fallback();
+            console.warn('Accelerometer error:', e.error);
+            startFallback();
           });
           sensor.start();
           return;
         } catch (e) {
-          console.warn('Accelerometer ctor failed', e);
+          console.warn('Accelerometer ctor failed:', e);
         }
       }
-      fallback();
+      startFallback();
     }
 
-    function fallback() {
+    // Fallback to devicemotion
+    function startFallback() {
       if (!('DeviceMotionEvent' in window)) {
         alert('No accelerometer support!');
         return;
       }
-      function listen() {
+      const listen = () => {
         window.addEventListener('devicemotion', ev => {
           const a = ev.accelerationIncludingGravity || ev.acceleration;
           if (!a) return;
-          buf.push({ t: performance.now(), x: a.x, y: a.y, z: a.z });
+          lastSample = { x: a.x, y: a.y, z: a.z };
         });
-      }
+      };
       if (typeof DeviceMotionEvent.requestPermission === 'function') {
         DeviceMotionEvent.requestPermission()
           .then(p => p === 'granted' ? listen() : alert('Permission denied'))
@@ -121,15 +102,12 @@
       }
     }
 
-    // 4) Wire up start button
+    // Wire up the Start button
     document.getElementById('startBtn').addEventListener('click', () => {
       document.getElementById('startBtn').disabled = true;
-      createChart();
-      startSensor();
+      startSensors();
+      setInterval(updatePlot, UPDATE_INTERVAL);
     });
   </script>
-
-  <!-- NOTE: chartjs-plugin-streaming is required for real-time chart support -->
-  <script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-streaming@2.0.0"></script>
 </body>
 </html>
