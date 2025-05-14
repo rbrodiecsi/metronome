@@ -1,131 +1,182 @@
-// scripts/main.js
-import { computeResultant, downloadCSV } from './analysis.js';
+// main.js
+import { computeResultant, downloadCSV, KalmanFilter1D } from './analysis.js';
 
-const MAX_WINDOW_MS     = 5000;
-const UPDATE_INTERVAL   = 100;    // ms between batch plots
-let buf                = [];      // raw {t,x,y,z}
-let sensor, fallbackUnsub;
-let updateTimer;
-let lastPlotTime       = 0;       // timestamp of last batch
+const MAX_WINDOW_MS   = 5000;
+const UPDATE_INTERVAL = 100;    // ms
+let buf     = [];               // raw {t,x,y,z}
+let velBuf  = [];               // fused {t, v}
+let sensor, fallbackUnsub, updateTimer, lastPlotTime;
+let kf;                         // our Kalman filter instance
+let gpsWatcherId;
+let lastGps = null;             // {lat, lon, ts}
 
 const startBtn    = document.getElementById('startBtn');
 const stopBtn     = document.getElementById('stopBtn');
 const downloadBtn = document.getElementById('downloadBtn');
 
+// 1) Initialize Plotly with two traces & dual y-axes
 function initChart() {
+    const accelTrace = {
+        x: [], y: [], name: 'Accel Resultant',
+        mode: 'lines', line: { color: 'steelblue' }
+    };
+    const velTrace = {
+        x: [], y: [], name: 'Fused Velocity',
+        mode: 'lines', line: { color: 'crimson' },
+        yaxis: 'y2'
+    };
     const layout = {
         margin: { t: 30 },
-        xaxis: {
-            type: 'date',
+        xaxis: { type: 'date',
             range: [Date.now() - MAX_WINDOW_MS, Date.now()],
-            title: 'Time'
-        },
-        yaxis: { title: 'Resultant (m/s²)' }
+            title: 'Time' },
+        yaxis: { title: 'Accel (m/s²)' },
+        yaxis2: {
+            title: 'Velocity (m/s)',
+            overlaying: 'y',
+            side: 'right'
+        }
     };
-    const trace = { x: [], y: [], name: 'Resultant', mode: 'lines', line: { color: 'steelblue' } };
-    Plotly.newPlot('chart', [trace], layout);
+    Plotly.newPlot('chart', [accelTrace, velTrace], layout);
 }
 
+// 2) Batch-plot all new samples in both buffers
 function updatePlot() {
     const now = Date.now();
 
-    // 1) prune out samples older than our window
-    buf = buf.filter(s => now - s.t <= MAX_WINDOW_MS);
+    // prune old
+    buf    = buf.filter(s => now - s.t <= MAX_WINDOW_MS);
+    velBuf = velBuf.filter(s => now - s.t <= MAX_WINDOW_MS);
 
-    // 2) grab only samples collected since lastPlotTime
-    const newSamples = buf.filter(s => s.t > lastPlotTime);
+    // fresh samples
+    const newAcc = buf.filter(s => s.t > lastPlotTime);
+    const newVel = velBuf.filter(s => s.t > lastPlotTime);
     lastPlotTime = now;
 
-    if (newSamples.length === 0) {
-        // nothing new—still slide window so axis stays up to date
-        Plotly.relayout('chart', {
-            'xaxis.range': [ now - MAX_WINDOW_MS, now ]
-        });
-        return;
+    if (newAcc.length || newVel.length) {
+        const xsAcc = newAcc.map(s => new Date(s.t));
+        const ysAcc = newAcc.map(s => computeResultant(s).mag);
+        const xsVel = newVel.map(s => new Date(s.t));
+        const ysVel = newVel.map(s => s.v);
+
+        Plotly.extendTraces('chart', {
+            x: [ xsAcc, xsVel ],
+            y: [ ysAcc, ysVel ]
+        }, [0, 1]);
     }
 
-    // 3) prepare arrays for Plotly
-    const xs = newSamples.map(s => new Date(s.t));
-    const ys = newSamples.map(s => computeResultant(s).mag);
-
-    // 4) batch-extend all points in one call
-    Plotly.extendTraces('chart', {
-        x: [ xs ],
-        y: [ ys ]
-    }, [0]);
-
-    // 5) slide the time window
+    // slide window
     Plotly.relayout('chart', {
-        'xaxis.range': [ now - MAX_WINDOW_MS, now ]
+        'xaxis.range': [now - MAX_WINDOW_MS, now]
     });
 }
 
+// 3) Sensor setup remains mostly the same, but we also call kf.predict & record vel
 function startSensors() {
+    kf = new KalmanFilter1D({
+        dt: UPDATE_INTERVAL / 1000,
+        R: 1,    // tune to your GPS noise
+        Q: 0.1   // tune to your accel noise
+    });
+
+    const onReading = (x, y, z) => {
+        const t = Date.now();
+        buf.push({ t, x, y, z });
+
+        // predict step on resultant magnitude
+        const { mag } = computeResultant({ t, x, y, z });
+        kf.predict(mag);
+
+        // record fused velocity
+        velBuf.push({ t, v: kf.velocity });
+    };
+
     if ('Accelerometer' in window) {
         try {
             sensor = new Accelerometer({ frequency: 60 });
             sensor.addEventListener('reading', () => {
-                buf.push({ t: Date.now(), x: sensor.x, y: sensor.y, z: sensor.z });
+                onReading(sensor.x, sensor.y, sensor.z);
             });
-            sensor.addEventListener('error', e => {
-                console.warn('Accel error', e.error);
-                startFallback();
-            });
+            sensor.addEventListener('error', () => startFallback(onReading));
             sensor.start();
             return;
-        } catch (err) {
-            console.warn('Accelerometer ctor failed:', err);
+        } catch {
+            startFallback(onReading);
         }
+    } else {
+        startFallback(onReading);
     }
-    startFallback();
+
+    // also start GPS watcher
+    if ('geolocation' in navigator) {
+        gpsWatcherId = navigator.geolocation.watchPosition(pos => {
+            const ts = pos.timestamp;
+
+            // 1) Try the direct GPS speed first
+            if (pos.coords.speed != null) {
+                // Doppler‐derived speed in m/s
+                kf.update(pos.coords.speed);
+                velBuf.push({ t: ts, v: kf.velocity });
+
+            } else if (lastGps) {
+                // 2) Fallback to position‐difference
+                const dt    = (ts - lastGps.ts) / 1000;                   // s
+                const dist  = haversine(pos.coords.latitude,
+                    pos.coords.longitude,
+                    lastGps.lat, lastGps.lon);      // m
+                const vGps  = dist / dt;                                  // m/s
+                kf.update(vGps);
+                velBuf.push({ t: ts, v: kf.velocity });
+            }
+
+            // 3) Update lastGps for next fallback
+            lastGps = { lat: pos.coords.latitude,
+                lon: pos.coords.longitude,
+                ts };
+        }, console.error, { enableHighAccuracy: true, maximumAge: 1000 });
+    }
 }
 
-function startFallback() {
+// 4) Fallback handler for devicemotion
+function startFallback(onReading) {
     if (!('DeviceMotionEvent' in window)) {
-        alert('No accelerometer support in this browser.');
+        alert('No accelerometer support');
         return;
     }
     const handler = ev => {
         const a = ev.accelerationIncludingGravity || ev.acceleration;
-        if (a) buf.push({ t: Date.now(), x: a.x, y: a.y, z: a.z });
+        if (a) onReading(a.x, a.y, a.z);
     };
-    if (typeof DeviceMotionEvent.requestPermission === 'function') {
+    if (DeviceMotionEvent.requestPermission) {
         DeviceMotionEvent.requestPermission()
-            .then(p => {
-                if (p === 'granted') {
-                    window.addEventListener('devicemotion', handler);
-                    fallbackUnsub = () => window.removeEventListener('devicemotion', handler);
-                } else {
-                    alert('Permission denied');
-                }
-            })
-            .catch(console.error);
+            .then(p => p === 'granted' && window.addEventListener('devicemotion', handler));
     } else {
         window.addEventListener('devicemotion', handler);
-        fallbackUnsub = () => window.removeEventListener('devicemotion', handler);
     }
+    fallbackUnsub = () => window.removeEventListener('devicemotion', handler);
 }
 
+// 5) Stop everything
 function stopSensors() {
-    if (sensor) {
-        try { sensor.stop(); } catch {}
-        sensor = null;
-    }
-    if (fallbackUnsub) {
-        fallbackUnsub();
-        fallbackUnsub = null;
+    if (sensor) { sensor.stop(); sensor = null; }
+    if (fallbackUnsub) { fallbackUnsub(); fallbackUnsub = null; }
+    if (gpsWatcherId != null) {
+        navigator.geolocation.clearWatch(gpsWatcherId);
+        gpsWatcherId = null;
     }
 }
 
+// 6) Wire up UI
 startBtn.addEventListener('click', () => {
     startBtn.disabled    = true;
     stopBtn.disabled     = false;
     downloadBtn.disabled = true;
 
     initChart();
+    lastPlotTime = Date.now();
+    updatePlot(); // initial
     startSensors();
-    lastPlotTime = Date.now();  // reset batch pointer
-    updateTimer  = setInterval(updatePlot, UPDATE_INTERVAL);
+    updateTimer = setInterval(updatePlot, UPDATE_INTERVAL);
 });
 
 stopBtn.addEventListener('click', () => {
@@ -138,5 +189,23 @@ stopBtn.addEventListener('click', () => {
 });
 
 downloadBtn.addEventListener('click', () => {
-    downloadCSV(buf);
+    // merge buffers and include velocity
+    const merged = buf.map((s, i) => {
+        // find closest vel sample by timestamp
+        const v = (velBuf.find(vs => vs.t >= s.t) || { v: NaN }).v;
+        return { ...s, v };
+    });
+    downloadCSV(merged);
 });
+
+// helper: haversine distance between two lat/lon in meters
+function haversine(lat1, lon1, lat2, lon2) {
+    const R = 6_371_000;
+    const toRad = n => n * Math.PI/180;
+    const dLat = toRad(lat2 - lat1);
+    const dLon = toRad(lon2 - lon1);
+    const a = Math.sin(dLat/2)**2 +
+        Math.cos(toRad(lat1))*Math.cos(toRad(lat2))*
+        Math.sin(dLon/2)**2;
+    return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+}
